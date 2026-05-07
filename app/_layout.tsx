@@ -1,3 +1,4 @@
+import 'react-native-url-polyfill/auto';
 import { ClerkProvider } from '@clerk/clerk-expo';
 import { Slot } from 'expo-router';
 import { useEffect, useState } from 'react';
@@ -42,9 +43,8 @@ export default function RootLayout() {
 
   return (
     <ClerkProvider 
-      publishableKey={publishableKey} 
+      publishableKey={publishableKey}
       tokenCache={tokenCache}
-      urlScheme="myapp"
     >
       {showLaunchImage ? (
         <View style={styles.launchContainer}>

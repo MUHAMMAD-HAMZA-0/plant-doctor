@@ -23,7 +23,8 @@ import {
   TouchableOpacity,
   View
 } from 'react-native';
-import Animated, { FadeInDown, FadeInUp, FadeOut, Layout } from 'react-native-reanimated';
+import OpenAI from 'openai';
+import Animated, { FadeInDown, FadeInUp, FadeOut, LinearTransition } from 'react-native-reanimated';
 import { G, Svg, Polygon as SvgPolygon } from 'react-native-svg';
 
 // Types for Chat
@@ -284,66 +285,63 @@ type PlantCarePlan = {
 
 type ParsedPlantReport = {
   plantTypeGuess: string;
+  healthSummary?: string;
   overallHealth: 'healthy' | 'mild_issue' | 'moderate_issue' | 'severe_issue' | 'unknown' | string;
   confidence: number;
   issues: PlantIssue[];
   carePlan: PlantCarePlan;
 };
 
-const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY?.trim();
-const GEMINI_VISION_MODEL =
-  process.env.EXPO_PUBLIC_GEMINI_VISION_MODEL?.trim() || 'gemini-2.5-flash';
-const GEMINI_TEXT_MODEL =
-  process.env.EXPO_PUBLIC_GEMINI_TEXT_MODEL?.trim() || 'gemini-2.5-flash';
+// ---------------------------------------------------------------------------
+// OpenAI Client — fully .env driven
+// ---------------------------------------------------------------------------
+const aiClient = new OpenAI({
+  apiKey: process.env.EXPO_PUBLIC_AI_API_KEY ?? '',
+  baseURL: process.env.EXPO_PUBLIC_AI_BASE_URL ?? 'https://api.openai.com/v1',
+  maxRetries: parseInt(process.env.EXPO_PUBLIC_AI_MAX_RETRIES ?? '3', 10),
+  timeout: parseInt(process.env.EXPO_PUBLIC_AI_TIMEOUT_MS ?? '30000', 10),
+  dangerouslyAllowBrowser: true,
+});
 
-const callGeminiGenerate = async ({
-  contents,
-  model,
-  maxOutputTokens = 900,
+const AI_MODEL = process.env.EXPO_PUBLIC_AI_MODEL ?? 'gpt-4.1';
+
+const callAI = async ({
+  systemPrompt,
+  userText,
+  imageBase64,
+  maxTokens = 900,
+  temperature = 0,
 }: {
-  contents: any[];
-  model: string;
-  maxOutputTokens?: number;
-}) => {
-  if (!GEMINI_API_KEY) {
-    throw new Error('EXPO_PUBLIC_GEMINI_API_KEY missing.');
-  }
+  systemPrompt?: string;
+  userText: string;
+  imageBase64?: string;
+  maxTokens?: number;
+  temperature?: number;
+}): Promise<string> => {
+  const userContent: OpenAI.ChatCompletionContentPart[] = [];
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
-    {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents,
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens,
-      },
-    }),
+  if (imageBase64) {
+    userContent.push({
+      type: 'image_url',
+      image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'high' },
+    });
+  }
+  userContent.push({ type: 'text', text: userText });
+
+  const messages: OpenAI.ChatCompletionMessageParam[] = [];
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+  messages.push({ role: 'user', content: userContent });
+
+  const response = await aiClient.chat.completions.create({
+    model: AI_MODEL,
+    max_tokens: maxTokens,
+    temperature,
+    messages,
   });
 
-  const json: any = await res.json();
-  if (!res.ok) {
-    const msg =
-      json?.error?.message ||
-      json?.message ||
-      `Gemini request failed with status ${res.status}`;
-    throw new Error(String(msg));
-  }
-
-  const content = Array.isArray(json?.candidates?.[0]?.content?.parts)
-    ? json.candidates[0].content.parts
-      .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
-      .join('\n')
-      .trim()
-    : '';
-  if (!content || typeof content !== 'string') {
-    throw new Error('Gemini returned empty content.');
-  }
-  return content.trim();
+  const content = response.choices[0]?.message?.content?.trim() ?? '';
+  if (!content) throw new Error('AI returned empty content.');
+  return content;
 };
 
 export default function App() {
@@ -369,7 +367,7 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    { id: '1', text: 'Hello! I am your Plant  Assistant. Ask me anything about plant health, watering, or pests!', sender: 'bot' }
+    { id: '1', text: 'Hey there! I am Dr. Leaf 🌿 — your personal plant doctor. I have had a look at your plant. What is on your mind?', sender: 'bot' }
   ]);
   const flatListRef = useRef<FlatList>(null);
 
@@ -434,6 +432,8 @@ export default function App() {
             typeof (obj as any).plantTypeGuess === 'string' && (obj as any).plantTypeGuess.trim()
               ? (obj as any).plantTypeGuess.trim()
               : 'unknown',
+          healthSummary:
+            typeof (obj as any).healthSummary === 'string' ? (obj as any).healthSummary.trim() : undefined,
           overallHealth:
             typeof (obj as any).overallHealth === 'string' && (obj as any).overallHealth.trim()
               ? (obj as any).overallHealth.trim()
@@ -662,14 +662,45 @@ export default function App() {
       .map((l) => l.trim())
       .filter(Boolean)
       .map((l) => l.replace(/^[-*•\d.\)\s]+/, '').trim())
+      // strip any remaining ** markdown
+      .map((l) => l.replace(/\*\*/g, ''))
       .filter(Boolean);
     return lines.length ? lines : [raw];
   })();
 
+  // Renders "Label: rest of text" with label bold
+  const renderSuggestionLine = (text: string, idx: number) => {
+    const colonIdx = text.indexOf(':');
+    if (colonIdx > 0 && colonIdx < 30) {
+      const label = text.slice(0, colonIdx).trim();
+      const body = text.slice(colonIdx + 1).trim();
+      return (
+        <View key={`s-${idx}`} style={styles.suggestionItem}>
+          <View style={styles.suggestionDot} />
+          <Text style={styles.suggestionText}>
+            <Text style={styles.suggestionLabel}>{label}: </Text>
+            {body}
+          </Text>
+        </View>
+      );
+    }
+    return (
+      <View key={`s-${idx}`} style={styles.suggestionItem}>
+        <View style={styles.suggestionDot} />
+        <Text style={styles.suggestionText}>{text}</Text>
+      </View>
+    );
+  };
+
   const overallHealthDetail = (() => {
     if (!parsedReport || Array.isArray((parsedReport as any).detections)) return null;
     const report = parsedReport as ParsedPlantReport;
-
+    // Use AI-generated detailed summary if available
+    const aiSummary = typeof (report as any).healthSummary === 'string'
+      ? (report as any).healthSummary.trim()
+      : null;
+    if (aiSummary) return aiSummary;
+    // Fallback
     const healthMap: Record<string, string> = {
       healthy: 'The plant appears overall stable with no major visible stress signs.',
       mild_issue: 'Minor stress signs detected; early care adjustments are recommended.',
@@ -677,16 +708,8 @@ export default function App() {
       severe_issue: 'Severe stress indicators detected. Immediate intervention recommended.',
       unknown: 'Model could not determine a clear health classification.',
     };
-
-    const issues = (report.issues || [])
-      .map((item) => `${item.issue} (${item.severity})`)
-      .slice(0, 3);
-
     const confidence = Math.round((report.confidence || 0) * 100);
-    const healthBase = healthMap[report.overallHealth] || `Health class: ${report.overallHealth}.`;
-    const issuesText = issues.length ? ` Key findings: ${issues.join(', ')}.` : '';
-
-    return `${healthBase} Confidence ${confidence}%.${issuesText}`;
+    return `${healthMap[report.overallHealth] || `Health class: ${report.overallHealth}.`} Confidence ${confidence}%.`;
   })();
 
   const handleImageLayout = (event: LayoutChangeEvent) => {
@@ -825,39 +848,20 @@ export default function App() {
     setChatMessages([
       {
         id: '1',
-        text: 'Hello! I am your Plant   Assistant. Ask me anything about plant health, watering, or pests!',
+        text: 'Hey there! I am Dr. Leaf 🌿 — your personal plant doctor. I have had a look at your plant. What is on your mind?',
         sender: 'bot',
       },
     ]);
 
-    if (!GEMINI_API_KEY) return;
-
     try {
       setIsValidating(true);
 
-      // Web-compatible base64 conversion
       const base64 = await imageUriToBase64(uri);
 
-      const text = await callGeminiGenerate({
-        model: GEMINI_VISION_MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text:
-                  'You are a strict bio-filter. Return ONLY raw JSON (no markdown): {"isPlant": true/false, "reason": "short reason"}. Determine if the image contains a real plant/leaf as the main subject.',
-              },
-              {
-                inlineData: {
-                  mimeType: 'image/jpeg',
-                  data: base64,
-                },
-              },
-            ],
-          },
-        ],
-        maxOutputTokens: 200,
+      const text = await callAI({
+        userText: 'You are a strict bio-filter. Return ONLY raw JSON (no markdown): {"isPlant": true/false, "reason": "short reason"}. Determine if the image contains a real plant/leaf as the main subject.',
+        imageBase64: base64,
+        maxTokens: 200,
       });
 
       let parsed: any = null;
@@ -888,7 +892,7 @@ export default function App() {
     setChatMessages([
       {
         id: '1',
-        text: 'Hello! I am your Plant Doctor Assistant. Ask me anything about plant health, watering, or pests!',
+        text: 'Hey there! I am Dr. Leaf 🌿 — your personal plant doctor. I have had a look at your plant. What is on your mind?',
         sender: 'bot',
       },
     ]);
@@ -905,47 +909,26 @@ export default function App() {
       return;
     }
 
-    if (!GEMINI_API_KEY) {
-      Alert.alert(
-        'Missing API Key',
-        'EXPO_PUBLIC_GEMINI_API_KEY is not set. Add it to your .env file and restart the app.'
-      );
-      return;
-    }
-
     try {
       setHasRequestedSuggestions(true);
       setIsSuggesting(true);
       setSuggestionText(null);
 
-      // Web-compatible base64 conversion
       const base64 = await imageUriToBase64(selectedImage);
 
-      const suggestionPrompt =
-        'You are an agronomy assistant. Based on the provided plant image and the JSON plant health report, give concise actionable suggestions in English.\n\nRules:\n- Use short bullet points (max 8).\n- Mention the most important issues first.\n- Cover immediate steps, watering, light, nutrition, and when to seek expert help.\n- Do not repeat the JSON.\n\nJSON Report:\n' +
-        analysisResult;
-
-      const text = await callGeminiGenerate({
-        model: GEMINI_VISION_MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text:
-                  'You are an agronomy assistant. Be concise, practical, and safety-focused.\n\n' +
-                  suggestionPrompt,
-              },
-              {
-                inlineData: {
-                  mimeType: 'image/jpeg',
-                  data: base64,
-                },
-              },
-            ],
-          },
-        ],
-        maxOutputTokens: 500,
+      const text = await callAI({
+        systemPrompt: 'You are a plant emergency advisor. Give IMMEDIATE actionable steps — things the owner should do TODAY or THIS WEEK to improve the plant. Never use markdown, asterisks, or bold formatting. Plain text only.',
+        userText:
+          'Based on this plant image and the health report below, give IMMEDIATE action steps — things to do right now, not routine care (routine care is already in the care plan).\n\n' +
+          'Rules:\n' +
+          '- Each line starts with the action topic followed by a colon. Example: "Check roots: Gently remove from pot and inspect for root rot."\n' +
+          '- Focus on: urgent problems, disease treatment, pest removal, environment fixes, rescue steps.\n' +
+          '- Do NOT repeat routine care (watering schedule, fertilizer, soil type) — that is already shown.\n' +
+          '- Max 7 steps. Plain text only. No asterisks, no markdown.\n\n' +
+          'Plant Health Report:\n' + analysisResult,
+        imageBase64: base64,
+        maxTokens: 500,
+        temperature: 0.3,
       });
       setSuggestionText(String(text).trim());
     } catch (e: any) {
@@ -970,27 +953,21 @@ export default function App() {
 
       const base64 = await imageUriToBase64(selectedImage);
 
-      const text = await callGeminiGenerate({
-        model: GEMINI_VISION_MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text:
-                  'You are an agronomy assistant. Analyze the entire plant image (not individual leaf crops). Return ONLY raw JSON (no markdown, no extra text) with this exact shape:\n' +
-                  '{"plantTypeGuess":"string|unknown","overallHealth":"healthy|mild_issue|moderate_issue|severe_issue|unknown","confidence":0.0,"issues":[{"issue":"string","severity":"low|medium|high|unknown","evidence":"short","action":"short"}],"carePlan":{"watering":"short","light":"short","soil":"short","fertilizer":"short","pestControl":"short"}}',
-              },
-              {
-                inlineData: {
-                  mimeType: 'image/jpeg',
-                  data: base64,
-                },
-              },
-            ],
-          },
-        ],
-        maxOutputTokens: 700,
+      const text = await callAI({
+        systemPrompt: 'You are an expert botanist and plant pathologist. Analyze plant images with high accuracy. Return ONLY raw JSON — no markdown, no extra text, no code fences.',
+        userText:
+          'Carefully examine this plant image. Identify the species and provide a thorough health assessment.\n\n' +
+          'Rules:\n' +
+          '- "plantTypeGuess": common name (e.g. "Monstera Deliciosa", "Peace Lily", "Fiddle Leaf Fig"). NEVER return "unknown" — always make your best identification from leaf shape, color, texture, growth pattern.\n' +
+          '- "healthSummary": 2-3 sentence detailed clinical description of what you visually observe — leaf color, texture, any spots/yellowing/wilting, stem condition, soil appearance. Be specific.\n' +
+          '- "overallHealth": one of healthy|mild_issue|moderate_issue|severe_issue|unknown\n' +
+          '- "confidence": 0.0 to 1.0\n' +
+          '- "issues": observed problems with severity and specific evidence from the image\n' +
+          '- "carePlan": specific ongoing care routines for THIS plant species (not generic advice)\n\n' +
+          'Return ONLY this JSON:\n' +
+          '{"plantTypeGuess":"string","healthSummary":"detailed 2-3 sentence observation","overallHealth":"healthy|mild_issue|moderate_issue|severe_issue|unknown","confidence":0.0,"issues":[{"issue":"string","severity":"low|medium|high","evidence":"specific visual evidence","action":"specific step"}],"carePlan":{"watering":"specific schedule","light":"specific requirement","soil":"soil type","fertilizer":"type and frequency","pestControl":"prevention or treatment"}}',
+        imageBase64: base64,
+        maxTokens: 900,
       });
 
       const normalized = String(text).trim();
@@ -1016,32 +993,51 @@ export default function App() {
     setIsChatLoading(true);
 
     try {
-      const systemPrompt =
-        'You are a friendly expert botanist. Answer questions about plant health and care briefly, clearly, and professionally. If the provided analysis report indicates disease or stress, give cautious and actionable advice. If unsure, ask 1 clarifying question.';
-
-      const userPrompt =
-        `Context: The user has analyzed a plant image. Here is the JSON report from the analysis:\n${analysisResult}\n\nUser question: ${chatInput}`;
-
-      const historyMessages = chatMessages
-        .filter((m) => m.sender === 'user' || m.sender === 'bot')
-        .filter((m) => m.text && m.text.trim().length > 0)
+      const history = chatMessages
+        .filter((m) => m.text.trim().length > 0)
         .slice(-10)
         .map((m) => ({
-          role: m.sender === 'user' ? 'user' : 'model',
-          parts: [{ text: m.text }],
+          role: (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+          content: m.text,
         }));
 
-      const finalUserText = `${systemPrompt}\n\n${userPrompt}`;
-      const botReply = await callGeminiGenerate({
-        model: GEMINI_TEXT_MODEL,
-        contents: [
-          ...historyMessages,
-          { role: 'user', parts: [{ text: finalUserText }] },
+      const response = await aiClient.chat.completions.create({
+        model: AI_MODEL,
+        max_tokens: 700,
+        temperature: 0.5,
+        messages: [
+          {
+            role: 'system',
+            content:
+              `You are Dr. Leaf — a warm, knowledgeable plant doctor with 20 years of experience. You speak like a real doctor having a consultation with a patient about their plant.
+
+Personality:
+- Conversational and warm, not robotic
+- Ask follow-up questions when needed ("How long has it been like this?", "Is it near a window?")
+- Give detailed, thoughtful answers — not just bullet points
+- Reference the plant by name (${parsedReport && !Array.isArray((parsedReport as any).detections) ? (parsedReport as ParsedPlantReport).plantTypeGuess : 'this plant'})
+- If the user greets you, greet back naturally and ask how you can help their plant today
+- Never dump a list of suggestions unless specifically asked — have a real conversation first
+
+Rules:
+- NEVER say "Based on the analysis" or "According to the report" — just talk naturally
+- Do NOT repeat the care plan or suggestions unless the user asks
+- If someone says "hi" or "hello", respond warmly and ask what's going on with their plant
+- Keep responses 2-4 sentences unless a detailed answer is needed
+- Use the plant context silently — don't mention you have a report
+
+Plant context (use silently, do not quote):
+${analysisResult}
+${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
+          },
+          ...history,
+          { role: 'user', content: chatInput },
         ],
-        maxOutputTokens: 700,
       });
+
       const finalText =
-        botReply || "I couldn't generate a reply. Try rephrasing your question.";
+        response.choices[0]?.message?.content?.trim() ||
+        "I couldn't generate a reply. Try rephrasing your question.";
 
       const botMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -1073,7 +1069,7 @@ export default function App() {
         <Animated.View
           style={styles.header}
           entering={FadeInDown.duration(350)}
-          layout={Layout.springify()}
+          layout={LinearTransition}
         >
           <TouchableOpacity
             onPress={() => setIsSidebarOpen(true)}
@@ -1145,7 +1141,7 @@ export default function App() {
             <Animated.View
               style={styles.instructionContainer}
               entering={FadeInUp.duration(350).delay(100)}
-              layout={Layout.springify()}
+              layout={LinearTransition}
             >
               <Text style={styles.instructionTitle}>Upload Plant Photo</Text>
               <Text style={styles.instructionText}>
@@ -1158,7 +1154,7 @@ export default function App() {
           <Animated.View
             style={styles.previewContainer}
             entering={FadeInUp.duration(350).delay(180)}
-            layout={Layout.springify()}
+            layout={LinearTransition}
           >
             {isAnalyzing ? (
               <View style={styles.loadingState}>
@@ -1170,13 +1166,13 @@ export default function App() {
                 style={styles.imageWrapper}
                 entering={FadeInUp.duration(250)}
                 exiting={FadeOut.duration(150)}
-                layout={Layout.springify()}
+                layout={LinearTransition}
               >
                 <View style={styles.imageFrame} onLayout={handleImageLayout}>
                   <Image
                     source={{ uri: selectedImage }}
                     style={styles.image}
-                    resizeMode="cover"
+                    resizeMode="contain"
                     onLoad={(event) => {
                       const source = (event as any)?.nativeEvent?.source;
                       if (source?.width > 0 && source?.height > 0) {
@@ -1269,25 +1265,31 @@ export default function App() {
                 </View>
 
                 <View style={styles.postImageContent}>
-                {/* Overlay Button */}
-                <TouchableOpacity onPress={removeImage} style={styles.retakeButton}>
-                  <Ionicons name="trash-outline" size={20} color="white" />
-                  <Text style={styles.retakeText}>Retake Photo</Text>
-                </TouchableOpacity>
-
+                {/* Action Row */}
                 {!analysisResult ? (
-                  <TouchableOpacity
-                    style={[
-                      styles.analyzeButton,
-                      isAnalyzing || isValidating || isPlantValid === false ? { opacity: 0.6 } : { opacity: 1 }
-                    ]}
-                    onPress={analyzePlantGrowth}
-                    disabled={isAnalyzing || isValidating || isPlantValid === false}
-                  >
-                    <Ionicons name="scan-outline" size={20} color="white" />
-                    <Text style={styles.analyzeText}>Analyze Plant</Text>
+                  <View style={styles.imageActionRow}>
+                    <TouchableOpacity onPress={removeImage} style={styles.retakeButton}>
+                      <Ionicons name="trash-outline" size={16} color="white" />
+                      <Text style={styles.retakeText}>Retake</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.analyzeButton,
+                        isAnalyzing || isValidating || isPlantValid === false ? { opacity: 0.55 } : { opacity: 1 }
+                      ]}
+                      onPress={analyzePlantGrowth}
+                      disabled={isAnalyzing || isValidating || isPlantValid === false}
+                    >
+                      <Ionicons name="scan-outline" size={16} color="white" />
+                      <Text style={styles.analyzeText}>Analyze Plant</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <TouchableOpacity onPress={removeImage} style={styles.retakeButtonCentered}>
+                    <Ionicons name="trash-outline" size={16} color="white" />
+                    <Text style={styles.retakeText}>Retake Photo</Text>
                   </TouchableOpacity>
-                ) : null}
+                )}
 
                 {isValidating ? (
                   <Text style={styles.validationText}>Validating image...</Text>
@@ -1301,7 +1303,7 @@ export default function App() {
                     style={styles.resultCard}
                     entering={FadeInUp.duration(300)}
                     exiting={FadeOut.duration(150)}
-                    layout={Layout.springify()}
+                    layout={LinearTransition}
                   >
                     <Text style={styles.resultTitle}>Plant Report</Text>
                     {parsedReport && !Array.isArray((parsedReport as any).detections) ? (
@@ -1309,7 +1311,9 @@ export default function App() {
                         <View style={styles.resultRow}>
                           <Text style={styles.resultLabel}>Plant</Text>
                           <Text style={styles.resultValue}>
-                            {(parsedReport as ParsedPlantReport).plantTypeGuess}
+                            {(parsedReport as ParsedPlantReport).plantTypeGuess === 'unknown'
+                              ? 'Unidentified Plant'
+                              : (parsedReport as ParsedPlantReport).plantTypeGuess}
                           </Text>
                         </View>
                         <View style={styles.resultRow}>
@@ -1408,8 +1412,7 @@ export default function App() {
                       <Text style={styles.resultText}>{analysisResult}</Text>
                     )}
 
-                    {hasRequestedSuggestions &&
-                    parsedReport &&
+                    {parsedReport &&
                     !Array.isArray((parsedReport as any).detections) &&
                     (parsedReport as ParsedPlantReport).carePlan ? (
                       <View style={styles.leafCard}>
@@ -1464,20 +1467,15 @@ export default function App() {
                         style={styles.suggestionCard}
                         entering={FadeInUp.duration(250)}
                         exiting={FadeOut.duration(150)}
-                        layout={Layout.springify()}
+                        layout={LinearTransition}
                       >
                         <Text style={styles.suggestionTitle}>Suggestions</Text>
                         {formattedSuggestions ? (
                           <View style={styles.suggestionList}>
-                            {formattedSuggestions.map((item, idx) => (
-                              <View key={`${idx}-${item}`} style={styles.suggestionItem}>
-                                <View style={styles.suggestionDot} />
-                                <Text style={styles.suggestionText}>{item}</Text>
-                              </View>
-                            ))}
+                            {formattedSuggestions.map((item, idx) => renderSuggestionLine(item, idx))}
                           </View>
                         ) : (
-                          <Text style={styles.suggestionText}>{suggestionText}</Text>
+                          <Text style={styles.suggestionText}>{suggestionText?.replace(/\*\*/g, '')}</Text>
                         )}
                       </Animated.View>
                     ) : null}
@@ -1489,7 +1487,7 @@ export default function App() {
               <Animated.View
                 entering={FadeInUp.duration(250)}
                 exiting={FadeOut.duration(150)}
-                layout={Layout.springify()}
+                layout={LinearTransition}
               >
                 <TouchableOpacity onPress={pickImage} style={styles.placeholder}>
                   <View style={styles.iconCircle}>
@@ -1506,7 +1504,7 @@ export default function App() {
         <Animated.View
           style={styles.bottomBar}
           entering={FadeInUp.duration(350).delay(120)}
-          layout={Layout.springify()}
+          layout={LinearTransition}
         >
           <View style={styles.buttonGrid}>
 
@@ -1551,7 +1549,7 @@ export default function App() {
                   <View style={styles.chatHeader}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
                       <Ionicons name="sparkles-outline" size={24} color="#064e3b" />
-                      <Text style={styles.chatHeaderTitle}>AI Assistant</Text>
+                      <Text style={styles.chatHeaderTitle}>Dr. Leaf 🌿</Text>
                     </View>
                     <TouchableOpacity onPress={() => setIsChatOpen(false)}>
                       <Ionicons name="close" size={24} color="#064e3b" />
@@ -1647,11 +1645,12 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   content: {
-    padding: 24,
+    padding: 16,
     flexGrow: 1,
   },
   contentImageMode: {
-    padding: 0,
+    padding: 16,
+    flexGrow: 0,
   },
   instructionContainer: {
     marginBottom: 30,
@@ -1670,7 +1669,6 @@ const styles = StyleSheet.create({
   },
   previewContainer: {
     alignItems: 'center',
-    minHeight: 300,
   },
   loadingState: {
     marginTop: 40,
@@ -1684,18 +1682,19 @@ const styles = StyleSheet.create({
   imageWrapper: {
     width: '100%',
     alignItems: 'center',
-    backgroundColor: '#000',
   },
   imageFrame: {
     width: '100%',
+    height: 260,
     position: 'relative',
-    marginBottom: 0,
-    backgroundColor: '#000',
+    backgroundColor: '#f0fdf4',
+    borderRadius: 20,
+    overflow: 'hidden',
   },
   image: {
     width: '100%',
-    aspectRatio: 3 / 4,
-    borderRadius: 0,
+    height: '100%',
+    borderRadius: 20,
   },
   svgOverlayLayer: {
     position: 'absolute',
@@ -1753,44 +1752,57 @@ const styles = StyleSheet.create({
     borderColor: '#fdba74',
   },
   postImageContent: {
-    paddingHorizontal: 20,
-    paddingTop: 16,
-    paddingBottom: 8,
-    gap: 12,
+    width: '100%',
+    paddingTop: 10,
+    gap: 8,
+  },
+  imageActionRow: {
+    flexDirection: 'row',
+    gap: 8,
   },
   retakeButton: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: '#ef4444',
     paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderRadius: 12,
-    marginBottom: 16,
-    gap: 8,
-    shadowColor: '#ef4444',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-    elevation: 4,
+    borderRadius: 14,
+    gap: 6,
+    elevation: 2,
+  },
+  retakeButtonCentered: {
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#ef4444',
+    paddingVertical: 10,
+    paddingHorizontal: 28,
+    borderRadius: 14,
+    gap: 6,
+    elevation: 2,
   },
   retakeText: {
     color: 'white',
-    fontWeight: 'bold',
+    fontWeight: '700',
+    fontSize: 14,
   },
   analyzeButton: {
-    width: '100%',
+    flex: 2,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#059669',
-    paddingVertical: 16,
-    borderRadius: 12,
-    gap: 8,
-    opacity: 0.6, // Disabled look
+    paddingVertical: 12,
+    borderRadius: 14,
+    gap: 6,
+    elevation: 2,
   },
   analyzeText: {
     color: 'white',
-    fontWeight: 'bold',
+    fontWeight: '700',
+    fontSize: 14,
   },
   resultBody: {
     marginTop: 10,
@@ -2008,9 +2020,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 6,
   },
+  suggestionLabel: {
+    color: '#065f46',
+    fontWeight: '800',
+    fontSize: 14,
+  },
   suggestionText: {
-    color: '#064e3b',
-    lineHeight: 20,
+    flex: 1,
+    color: '#1a3d2b',
+    lineHeight: 22,
+    fontSize: 14,
   },
   suggestionList: {
     marginTop: 8,
