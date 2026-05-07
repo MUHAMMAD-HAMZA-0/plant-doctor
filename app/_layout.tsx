@@ -1,24 +1,72 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
-import 'react-native-reanimated';
+import { ClerkProvider } from '@clerk/clerk-expo';
+import { Slot } from 'expo-router';
+import { useEffect, useState } from 'react';
+import { ImageBackground, StyleSheet, View } from 'react-native';
+import * as SecureStore from 'expo-secure-store'; // Ye zaroori hai
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
+const publishableKey =
+  process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY ??
+  "pk_test_bWFpbi13b21iYXQtOTYuY2xlcmsuYWNjb3VudHMuZGV2JA";
 
-export const unstable_settings = {
-  anchor: '(tabs)',
+if (!publishableKey) {
+  throw new Error(
+    'Missing EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY. Set it in your .env file.'
+  );
+}
+
+// Token Cache ko manually define karein (Best Practice)
+const tokenCache = {
+  async getToken(key: string) {
+    try {
+      return SecureStore.getItemAsync(key);
+    } catch (err) {
+      return null;
+    }
+  },
+  async saveToken(key: string, value: string) {
+    try {
+      return SecureStore.setItemAsync(key, value);
+    } catch (err) {
+      return;
+    }
+  },
 };
 
 export default function RootLayout() {
-  const colorScheme = useColorScheme();
+  const [showLaunchImage, setShowLaunchImage] = useState(true);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setShowLaunchImage(false), 1800);
+    return () => clearTimeout(timer);
+  }, []);
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-      </Stack>
-      <StatusBar style="auto" />
-    </ThemeProvider>
+    <ClerkProvider 
+      publishableKey={publishableKey} 
+      tokenCache={tokenCache}
+      urlScheme="myapp"
+    >
+      {showLaunchImage ? (
+        <View style={styles.launchContainer}>
+          <ImageBackground
+            source={require('@/assets/images/plant.png')}
+            style={styles.launchImage}
+            resizeMode="cover"
+          />
+        </View>
+      ) : (
+        <Slot />
+      )}
+    </ClerkProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  launchContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  launchImage: {
+    flex: 1,
+  },
+});

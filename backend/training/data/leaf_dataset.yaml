@@ -1,0 +1,7 @@
+path: backend/training/datasets/leaf_detection
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: leaf
