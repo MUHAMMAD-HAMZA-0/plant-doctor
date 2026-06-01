@@ -4,6 +4,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as ExpoLinking from 'expo-linking';
+import * as Print from 'expo-print';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -16,6 +17,7 @@ import {
   Modal,
   Platform,
   SafeAreaView,
+  Share,
   ScrollView,
   StyleSheet,
   Text,
@@ -98,6 +100,16 @@ interface BackendLeafResult {
   } | null;
 }
 
+interface PlantScanEntry {
+  id: string;
+  plantId: string;
+  scannedAt: string;
+  damageScore: number;
+  recoveryScore: number;
+  trend: 'better' | 'worse' | 'stable';
+  issue: string;
+}
+
 const parseJsonText = (value: string) => {
   try {
     return JSON.parse(value);
@@ -173,6 +185,29 @@ const formatConfidence = (confidence?: number | string | null) => {
   const normalized = value <= 1 ? value * 100 : value;
   return `${Math.round(normalized)}%`;
 };
+
+const SCORE_WEIGHTS: Record<string, number> = {
+  healthy: 0,
+  low: 30,
+  mild: 30,
+  medium: 60,
+  moderate: 60,
+  high: 90,
+  severe: 90,
+  unknown: 45,
+};
+
+const getSeverityWeight = (severity: string) => {
+  const key = severity.toLowerCase().trim();
+  return SCORE_WEIGHTS[key] ?? SCORE_WEIGHTS.unknown;
+};
+
+const formatScanDate = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
 
 /**
  * Calculate the centroid (center point) of a polygon contour.
@@ -304,6 +339,8 @@ const aiClient = new OpenAI({
 });
 
 const AI_MODEL = process.env.EXPO_PUBLIC_AI_MODEL ?? 'gpt-4.1';
+const HISTORY_API_BASE_URL =
+  process.env.EXPO_PUBLIC_API_BASE_URL?.trim() || 'http://127.0.0.1:8000';
 
 const callAI = async ({
   systemPrompt,
@@ -361,6 +398,13 @@ export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [imageOverlaySize, setImageOverlaySize] = useState({ width: 0, height: 0 });
   const [originalImageSize, setOriginalImageSize] = useState({ width: 0, height: 0 });
+  const [plantIdInput, setPlantIdInput] = useState('My Plant');
+  const [activePlantId, setActivePlantId] = useState('My Plant');
+  const [scanHistory, setScanHistory] = useState<PlantScanEntry[]>([]);
+  const [latestAlert, setLatestAlert] = useState<string | null>(null);
+  const [lastTrackedSignature, setLastTrackedSignature] = useState<string | null>(null);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
 
   // --- NEW CHAT STATES ---
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -760,6 +804,162 @@ export default function App() {
         })
       : [];
 
+  const normalizedPlantId =
+    activePlantId.trim() ||
+    (parsedReport && !Array.isArray((parsedReport as any).detections)
+      ? (parsedReport as ParsedPlantReport).plantTypeGuess
+      : 'My Plant');
+
+  const saveTrackerName = () => {
+    const next = plantIdInput.trim();
+    if (!next) {
+      Alert.alert('Tracker Name Required', 'Please enter a plant tracker name first.');
+      return;
+    }
+    setActivePlantId(next);
+    setLatestAlert(null);
+    Alert.alert('Saved', `Tracker name saved as "${next}".`);
+  };
+
+  const historyFilePath = `${FileSystem.documentDirectory}plant-scan-history-${user?.id || 'guest'}.json`;
+
+  const calculateDamageScore = () => {
+    if (analyzedLeaves.length > 0) {
+      const total = analyzedLeaves.reduce((sum, leaf) => {
+        const severity = leaf.analysis?.severity || 'unknown';
+        return sum + getSeverityWeight(severity);
+      }, 0);
+      return Math.round(total / analyzedLeaves.length);
+    }
+
+    if (parsedReport && !Array.isArray((parsedReport as any).detections)) {
+      const report = parsedReport as ParsedPlantReport;
+      if (!report.issues.length && report.overallHealth === 'healthy') return 0;
+      if (report.issues.length) {
+        const total = report.issues.reduce((sum, issue) => sum + getSeverityWeight(issue.severity), 0);
+        return Math.round(total / report.issues.length);
+      }
+      return getSeverityWeight(report.overallHealth);
+    }
+
+    return null;
+  };
+
+  useEffect(() => {
+    const loadHistory = async () => {
+      try {
+        if (user?.id) {
+          const response = await fetch(
+            `${HISTORY_API_BASE_URL}/api/history/${encodeURIComponent(user.id)}/${encodeURIComponent(normalizedPlantId)}`
+          );
+          if (response.ok) {
+            const serverHistory = (await response.json()) as PlantScanEntry[];
+            if (Array.isArray(serverHistory) && serverHistory.length) {
+              setScanHistory((prev) => {
+                const map = new Map(prev.map((item) => [item.id, item]));
+                for (const row of serverHistory) {
+                  if (row && typeof row === 'object') {
+                    map.set(String(row.id), row);
+                  }
+                }
+                return [...map.values()];
+              });
+            }
+          }
+        }
+
+        const fileInfo = await FileSystem.getInfoAsync(historyFilePath);
+        if (!fileInfo.exists) return;
+        const raw = await FileSystem.readAsStringAsync(historyFilePath);
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setScanHistory((prev) => {
+            const map = new Map(prev.map((item) => [item.id, item]));
+            for (const row of parsed) {
+              if (row && typeof row === 'object') {
+                map.set(String((row as any).id), row as PlantScanEntry);
+              }
+            }
+            return [...map.values()];
+          });
+        }
+      } catch {
+        // Keep existing in-memory history if fetch/file read fails.
+      }
+    };
+    loadHistory();
+  }, [historyFilePath, user?.id, normalizedPlantId]);
+
+  useEffect(() => {
+    FileSystem.writeAsStringAsync(historyFilePath, JSON.stringify(scanHistory)).catch(() => {});
+  }, [historyFilePath, scanHistory]);
+
+  useEffect(() => {
+    const damageScore = calculateDamageScore();
+    if (!analysisResult || damageScore === null) return;
+
+    const signature = `${normalizedPlantId}|${analysisResult}`;
+    if (lastTrackedSignature === signature) return;
+
+    setScanHistory((prev) => {
+      const plantScans = prev.filter((item) => item.plantId === normalizedPlantId);
+      const previous = plantScans[plantScans.length - 1];
+      const baseline = plantScans[0]?.damageScore ?? damageScore;
+      const diff = previous ? damageScore - previous.damageScore : 0;
+      const trend: 'better' | 'worse' | 'stable' =
+        Math.abs(diff) < 3 ? 'stable' : diff > 0 ? 'worse' : 'better';
+      const recoveryScore = Math.max(0, Math.min(100, Math.round(50 + (baseline - damageScore))));
+      const issue =
+        parsedReport && Array.isArray((parsedReport as any).detections)
+          ? (parsedReport as ParsedLeafReport).summary?.dominantIssue || 'Unknown'
+          : parsedReport && !Array.isArray((parsedReport as any).detections)
+            ? (parsedReport as ParsedPlantReport).issues?.[0]?.issue || 'General stress'
+            : 'Unknown';
+
+      const nextEntry: PlantScanEntry = {
+        id: `${Date.now()}`,
+        plantId: normalizedPlantId,
+        scannedAt: new Date().toISOString(),
+        damageScore,
+        recoveryScore,
+        trend,
+        issue,
+      };
+
+      if (user?.id) {
+        fetch(`${HISTORY_API_BASE_URL}/api/history/scan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: user.id,
+            plantId: normalizedPlantId,
+            damageScore,
+            recoveryScore,
+            trend,
+            issue,
+            scannedAt: nextEntry.scannedAt,
+          }),
+        }).catch(() => {});
+      }
+
+      if (previous && previous.damageScore > 0) {
+        const pct = Math.round(((damageScore - previous.damageScore) / previous.damageScore) * 100);
+        const since = formatScanDate(previous.scannedAt);
+        if (pct >= 15) {
+          const alertText = `Condition ${pct}% worse since ${since}`;
+          setLatestAlert(alertText);
+          Alert.alert('Plant Health Alert', alertText);
+        } else if (pct <= -10) {
+          const alertText = `Great: condition improved ${Math.abs(pct)}% since ${since}`;
+          setLatestAlert(alertText);
+        }
+      }
+
+      return [...prev, nextEntry];
+    });
+    setLastTrackedSignature(signature);
+  }, [analysisResult, normalizedPlantId, lastTrackedSignature, parsedReport, analyzedLeaves, calculateDamageScore, user?.id]);
+
   // --- Gallery Se Image Lena ---
   const pickImage = async () => {
     const existing = await ImagePicker.getMediaLibraryPermissionsAsync();
@@ -943,6 +1143,13 @@ export default function App() {
       Alert.alert('No Image', 'Please select a photo first.');
       return;
     }
+    if (!plantIdInput.trim()) {
+      Alert.alert('Tracker Name Required', 'Please enter and save a plant tracker name first.');
+      return;
+    }
+    if (activePlantId.trim() !== plantIdInput.trim()) {
+      setActivePlantId(plantIdInput.trim());
+    }
 
     try {
       setIsAnalyzing(true);
@@ -1057,9 +1264,131 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
     }
   };
 
+  const currentPlantScans = scanHistory.filter((item) => item.plantId === normalizedPlantId);
+  const latestScan = currentPlantScans[currentPlantScans.length - 1] || null;
+  const previousScan =
+    currentPlantScans.length > 1 ? currentPlantScans[currentPlantScans.length - 2] : null;
+  const historyRows = [...scanHistory].sort(
+    (a, b) => new Date(b.scannedAt).getTime() - new Date(a.scannedAt).getTime()
+  );
+
+  const exportPdfReport = async () => {
+    if (!analysisResult) {
+      Alert.alert('No Report', 'Please analyze a plant first.');
+      return;
+    }
+    try {
+      setIsExportingPdf(true);
+      const safePlantName = normalizedPlantId || 'My Plant';
+      const timelineRows = currentPlantScans
+        .slice(-10)
+        .map(
+          (scan) => `
+            <tr>
+              <td>${new Date(scan.scannedAt).toLocaleString()}</td>
+              <td>${scan.damageScore}</td>
+              <td>${scan.recoveryScore}</td>
+              <td>${scan.trend}</td>
+              <td>${scan.issue}</td>
+            </tr>
+          `
+        )
+        .join('');
+
+      const carePlan =
+        parsedReport && !Array.isArray((parsedReport as any).detections)
+          ? (parsedReport as ParsedPlantReport).carePlan
+          : null;
+      const plantCondition =
+        parsedReport && !Array.isArray((parsedReport as any).detections)
+          ? (parsedReport as ParsedPlantReport).overallHealth.replace(/_/g, ' ')
+          : latestScan?.trend || 'stable';
+      const healthDetails = overallHealthDetail || 'N/A';
+
+      const html = `
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <style>
+              body { font-family: Arial, sans-serif; padding: 20px; color: #0f172a; }
+              h1 { margin: 0 0 6px 0; color: #1d4ed8; }
+              h2 { margin: 18px 0 8px 0; color: #0f172a; }
+              .meta { color: #334155; margin-bottom: 8px; }
+              .card { border: 1px solid #cbd5e1; border-radius: 10px; padding: 12px; margin-top: 8px; }
+              .row { margin: 4px 0; }
+              .label { font-weight: bold; }
+              table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+              th, td { border: 1px solid #cbd5e1; padding: 6px; text-align: left; vertical-align: top; }
+              th { background: #e2e8f0; }
+              .small { font-size: 11px; color: #475569; }
+            </style>
+          </head>
+          <body>
+            <h1>Plant Health Report</h1>
+            <div class="meta">Generated: ${new Date().toLocaleString()}</div>
+            <div class="meta">Tracker: ${safePlantName}</div>
+
+            <h2>Condition Summary</h2>
+            <div class="card">
+              <div class="row"><span class="label">Current Condition:</span> ${plantCondition}</div>
+              <div class="row"><span class="label">Health Details:</span> ${healthDetails}</div>
+              <div class="row"><span class="label">Recovery Score:</span> ${latestScan?.recoveryScore ?? 'N/A'}</div>
+            </div>
+
+            <h2>Care Plan</h2>
+            <div class="card">
+              <div class="row"><span class="label">Watering:</span> ${carePlan?.watering || 'N/A'}</div>
+              <div class="row"><span class="label">Light:</span> ${carePlan?.light || 'N/A'}</div>
+              <div class="row"><span class="label">Soil:</span> ${carePlan?.soil || 'N/A'}</div>
+              <div class="row"><span class="label">Fertilizer:</span> ${carePlan?.fertilizer || 'N/A'}</div>
+              <div class="row"><span class="label">Pest Control:</span> ${carePlan?.pestControl || 'N/A'}</div>
+            </div>
+
+            <h2>Timeline</h2>
+            <div class="card">
+              <div class="small">Last ${Math.min(currentPlantScans.length, 10)} scans for this tracker</div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Damage</th>
+                    <th>Recovery</th>
+                    <th>Trend</th>
+                    <th>Issue</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${
+                    timelineRows ||
+                    '<tr><td colspan="5">No timeline entries available yet.</td></tr>'
+                  }
+                </tbody>
+              </table>
+            </div>
+          </body>
+        </html>
+      `;
+
+      const { uri } = await Print.printToFileAsync({
+        html,
+        base64: false,
+      });
+
+      await Share.share({
+        title: 'Plant Health Report',
+        message: Platform.OS === 'android' ? `Plant Health Report\n${uri}` : 'Plant Health Report',
+        url: uri,
+      });
+    } catch (error: any) {
+      Alert.alert('Export Failed', error?.message || 'Unable to export PDF report.');
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
   return (
     <LinearGradient
-      colors={['#f0fdf4', '#ecfdf5', '#f0fdfa']} // Greenish gradient
+      colors={['#0b1020', '#16213a', '#1f3a5f']}
       style={styles.container}
     >
       <StatusBar style="dark" />
@@ -1076,19 +1405,19 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
             style={styles.headerIconButton}
             accessibilityLabel="Open menu"
           >
-            <Ionicons name="menu" size={24} color="#064e3b" />
+            <Ionicons name="menu" size={24} color="#e2e8f0" />
           </TouchableOpacity>
 
           <View>
             <View style={styles.titleRow}>
-              <Ionicons name="leaf-outline" size={24} color="#059669" />
+              <Ionicons name="leaf-outline" size={24} color="#5eead4" />
               <Text style={styles.title}>Plant Doctor</Text>
             </View>
             <Text style={styles.subtitle}>Disease Detection Scanner</Text>
           </View>
 
           <View style={styles.headerRight}>
-            <Ionicons name="leaf-outline" size={24} color="#6ee7b7" />
+            <Ionicons name="leaf-outline" size={24} color="#5eead4" />
           </View>
         </Animated.View>
 
@@ -1112,7 +1441,7 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
                   style={styles.headerIconButton}
                   accessibilityLabel="Close menu"
                 >
-                  <Ionicons name="close" size={24} color="#064e3b" />
+                  <Ionicons name="close" size={24} color="#e2e8f0" />
                 </TouchableOpacity>
               </View>
 
@@ -1150,6 +1479,23 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
             </Animated.View>
           )}
 
+          <View style={styles.plantIdCard}>
+            <Text style={styles.plantIdLabel}>Plant Tracker Name</Text>
+            <TextInput
+              value={plantIdInput}
+              onChangeText={setPlantIdInput}
+              placeholder="e.g. Balcony Monstera"
+              placeholderTextColor="#94a3b8"
+              style={styles.plantIdInput}
+            />
+            <View style={styles.trackerActionsRow}>
+              <Text style={styles.activeTrackerText}>Tracking: {normalizedPlantId}</Text>
+              <TouchableOpacity style={styles.saveTrackerButton} onPress={saveTrackerName}>
+                <Text style={styles.saveTrackerButtonText}>Save Tracker</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
           {/* Image Preview Area */}
           <Animated.View
             style={styles.previewContainer}
@@ -1158,7 +1504,7 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
           >
             {isAnalyzing ? (
               <View style={styles.loadingState}>
-                <Ionicons name="scan-outline" size={64} color="#10b981" />
+                <Ionicons name="scan-outline" size={64} color="#38bdf8" />
                 <Text style={styles.loadingText}>Analyzing Image...</Text>
               </View>
             ) : selectedImage ? (
@@ -1479,6 +1825,18 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
                         )}
                       </Animated.View>
                     ) : null}
+
+                    <TouchableOpacity
+                      style={[styles.exportPdfButton, isExportingPdf && styles.buttonDisabled]}
+                      disabled={isExportingPdf}
+                      onPress={exportPdfReport}
+                    >
+                      <Ionicons name="download-outline" size={16} color="#ffffff" />
+                      <Text style={styles.exportPdfButtonText}>
+                        {isExportingPdf ? 'Exporting PDF...' : 'Export PDF Report'}
+                      </Text>
+                    </TouchableOpacity>
+
                   </Animated.View>
                 ) : null}
                 </View>
@@ -1491,13 +1849,72 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
               >
                 <TouchableOpacity onPress={pickImage} style={styles.placeholder}>
                   <View style={styles.iconCircle}>
-                    <Ionicons name="leaf-outline" size={48} color="#10b981" />
+                    <Ionicons name="leaf-outline" size={48} color="#0ea5e9" />
                   </View>
                   <Text style={styles.placeholderText}>Tap to select a plant photo</Text>
                 </TouchableOpacity>
               </Animated.View>
             )}
           </Animated.View>
+
+          <View style={styles.timelineCard}>
+            <View style={styles.timelineHeader}>
+              <Text style={styles.timelineTitle}>Leaf Timeline</Text>
+              <View style={styles.timelineHeaderRight}>
+                <Text style={styles.timelineMeta}>{currentPlantScans.length} scans</Text>
+                <TouchableOpacity
+                  style={styles.historyButton}
+                  onPress={() => setIsHistoryOpen(true)}
+                >
+                  <Text style={styles.historyButtonText}>History</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            {currentPlantScans.length ? (
+              <>
+                <Text style={styles.timelineSubtext}>
+                  Trend: {latestScan?.trend || 'stable'} | Recovery Score:{' '}
+                  {latestScan?.recoveryScore ?? '--'}
+                </Text>
+                {latestAlert ? <Text style={styles.alertText}>{latestAlert}</Text> : null}
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.graphRow}>
+                  {currentPlantScans.slice(-8).map((scan) => (
+                    <View key={scan.id} style={styles.graphBarWrap}>
+                      <View
+                        style={[
+                          styles.graphBar,
+                          {
+                            height: Math.max(10, scan.damageScore),
+                            backgroundColor:
+                              scan.trend === 'worse'
+                                ? '#ef4444'
+                                : scan.trend === 'better'
+                                  ? '#22c55e'
+                                  : '#f59e0b',
+                          },
+                        ]}
+                      />
+                      <Text style={styles.graphLabel}>
+                        {new Date(scan.scannedAt).toLocaleDateString(undefined, {
+                          month: 'numeric',
+                          day: 'numeric',
+                        })}
+                      </Text>
+                    </View>
+                  ))}
+                </ScrollView>
+                {latestScan && previousScan ? (
+                  <Text style={styles.timelineSubtext}>
+                    Damage Score: {previousScan.damageScore}{' -> '}{latestScan.damageScore}
+                  </Text>
+                ) : null}
+              </>
+            ) : (
+              <Text style={styles.timelineSubtext}>
+                No history yet. First analysis ke baad graph yahin show hoga.
+              </Text>
+            )}
+          </View>
         </ScrollView>
 
         {/* Bottom Actions */}
@@ -1510,7 +1927,7 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
 
             {/* Gallery Button */}
             <TouchableOpacity onPress={pickImage} style={styles.galleryButton}>
-              <Ionicons name="images-outline" size={28} color="#047857" />
+              <Ionicons name="images-outline" size={28} color="#7dd3fc" />
               <Text style={styles.galleryButtonText}>Gallery</Text>
             </TouchableOpacity>
 
@@ -1522,76 +1939,48 @@ ${suggestionText ? '\nImmediate actions context:\n' + suggestionText : ''}`,
 
           </View>
 
-          {analysisResult ? (
-            <TouchableOpacity
-              onPress={getSuggestions}
-              style={[styles.suggestionButton, isSuggesting ? { opacity: 0.7 } : { opacity: 1 }]}
-              disabled={isSuggesting}
-            >
-              <Ionicons name="bulb-outline" size={22} color="#064e3b" />
-              <Text style={styles.suggestionButtonText}>Suggestions</Text>
-            </TouchableOpacity>
-          ) : null}
+          {analysisResult ? null : null}
         </Animated.View>
 
-        {analysisResult ? (
-          <>
-            {/* 🟢 NEW: FLOATING CHAT BUTTON */}
-            <TouchableOpacity style={styles.fab} onPress={() => setIsChatOpen(true)}>
-              <Ionicons name="sparkles-outline" size={28} color="#fff" />
-            </TouchableOpacity>
+        {analysisResult ? null : null}
 
-            {/* 🟢 NEW: CHAT MODAL */}
-            <Modal visible={isChatOpen} animationType="slide" transparent onRequestClose={() => setIsChatOpen(false)}>
-              <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.chatModalOverlay}>
-                <View style={styles.chatContainer}>
-                  {/* Chat Header */}
-                  <View style={styles.chatHeader}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-                      <Ionicons name="sparkles-outline" size={24} color="#064e3b" />
-                      <Text style={styles.chatHeaderTitle}>Dr. Leaf 🌿</Text>
+        <Modal
+          transparent
+          visible={isHistoryOpen}
+          animationType="slide"
+          onRequestClose={() => setIsHistoryOpen(false)}
+        >
+          <View style={styles.historyOverlay}>
+            <View style={styles.historySheet}>
+              <View style={styles.historyHeader}>
+                <Text style={styles.historyTitle}>Scan History (All Plants)</Text>
+                <TouchableOpacity onPress={() => setIsHistoryOpen(false)} style={styles.historyCloseButton}>
+                  <Ionicons name="close" size={20} color="#e2e8f0" />
+                </TouchableOpacity>
+              </View>
+              {historyRows.length ? (
+                <FlatList
+                  data={historyRows}
+                  keyExtractor={(item) => item.id}
+                  renderItem={({ item }) => (
+                    <View style={styles.historyItem}>
+                      <Text style={styles.historyDate}>
+                        {new Date(item.scannedAt).toLocaleString()}
+                      </Text>
+                      <Text style={styles.historyPlant}>Plant: {item.plantId}</Text>
+                      <Text style={styles.historyText}>
+                        Damage: {item.damageScore} | Recovery: {item.recoveryScore} | Trend: {item.trend}
+                      </Text>
+                      <Text style={styles.historyIssue}>Issue: {item.issue}</Text>
                     </View>
-                    <TouchableOpacity onPress={() => setIsChatOpen(false)}>
-                      <Ionicons name="close" size={24} color="#064e3b" />
-                    </TouchableOpacity>
-                  </View>
-
-                  {/* Messages */}
-                  <FlatList
-                    ref={flatListRef}
-                    data={chatMessages}
-                    keyExtractor={item => item.id}
-                    contentContainerStyle={{ padding: 16 }}
-                    onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
-                    renderItem={({ item }) => (
-                      <View style={[styles.chatBubble, item.sender === 'user' ? styles.userBubble : styles.botBubble]}>
-                        <Text style={[styles.chatText, item.sender === 'user' ? styles.userChatText : styles.botChatText]}>
-                          {item.text}
-                        </Text>
-                      </View>
-                    )}
-                  />
-
-                  {isChatLoading && <Text style={styles.typingText}>AI is typing...</Text>}
-
-                  {/* Input */}
-                  <View style={styles.chatInputContainer}>
-                    <TextInput
-                      style={styles.chatInput}
-                      placeholder="Ask about plants..."
-                      value={chatInput}
-                      onChangeText={setChatInput}
-                      placeholderTextColor="#9ca3af"
-                    />
-                    <TouchableOpacity onPress={handleSendChat} style={styles.sendButton}>
-                      <Ionicons name="send" size={20} color="#fff" />
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </KeyboardAvoidingView>
-            </Modal>
-          </>
-        ) : null}
+                  )}
+                />
+              ) : (
+                <Text style={styles.timelineSubtext}>No history yet.</Text>
+              )}
+            </View>
+          </View>
+        </Modal>
 
       </SafeAreaView>
     </LinearGradient>
@@ -1611,9 +2000,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.8)',
+    backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderBottomWidth: 1,
-    borderBottomColor: '#d1fae5',
+    borderBottomColor: 'rgba(125, 211, 252, 0.35)',
   },
   titleRow: {
     flexDirection: 'row',
@@ -1626,9 +2015,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(236, 253, 245, 0.9)',
+    backgroundColor: 'rgba(30, 41, 59, 0.95)',
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: 'rgba(125, 211, 252, 0.32)',
   },
   headerRight: {
     width: 40,
@@ -1637,11 +2026,11 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 20,
     fontWeight: 'bold',
-    color: '#064e3b',
+    color: '#f8fafc',
   },
   subtitle: {
     fontSize: 12,
-    color: '#059669',
+    color: '#7dd3fc',
     marginTop: 2,
   },
   content: {
@@ -1663,9 +2052,59 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   instructionText: {
-    color: '#4b5563',
+    color: '#cbd5e1',
     textAlign: 'center',
     fontSize: 14,
+  },
+  plantIdCard: {
+    marginBottom: 14,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    borderWidth: 1,
+    borderColor: 'rgba(125, 211, 252, 0.32)',
+    borderRadius: 14,
+    padding: 12,
+    gap: 8,
+  },
+  plantIdLabel: {
+    color: '#cbd5e1',
+    fontWeight: '700',
+    fontSize: 12,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+  },
+  plantIdInput: {
+    borderWidth: 1,
+    borderColor: 'rgba(125, 211, 252, 0.32)',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#f8fafc',
+    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+    fontSize: 15,
+  },
+  trackerActionsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 2,
+    gap: 8,
+  },
+  activeTrackerText: {
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: '600',
+    flex: 1,
+  },
+  saveTrackerButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: '#2563eb',
+  },
+  saveTrackerButtonText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 12,
   },
   previewContainer: {
     alignItems: 'center',
@@ -1687,7 +2126,7 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 260,
     position: 'relative',
-    backgroundColor: '#f0fdf4',
+    backgroundColor: '#0b1a2e',
     borderRadius: 20,
     overflow: 'hidden',
   },
@@ -1793,7 +2232,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#059669',
+    backgroundcolor: '#7dd3fc',
     paddingVertical: 12,
     borderRadius: 14,
     gap: 6,
@@ -1826,12 +2265,12 @@ const styles = StyleSheet.create({
   },
   resultValue: {
     flex: 1,
-    color: '#064e3b',
+    color: '#f8fafc',
     fontWeight: '600',
     textAlign: 'right',
   },
   metricsText: {
-    color: '#064e3b',
+    color: '#f8fafc',
     fontWeight: '500',
     lineHeight: 20,
     fontFamily: 'monospace',
@@ -1856,20 +2295,20 @@ const styles = StyleSheet.create({
   resultCard: {
     width: '100%',
     marginTop: 16,
-    backgroundColor: 'rgba(255,255,255,0.9)',
+    backgroundColor: 'rgba(15, 23, 42, 0.92)',
     borderRadius: 16,
     padding: 14,
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: 'rgba(125, 211, 252, 0.32)',
   },
   resultTitle: {
-    color: '#064e3b',
+    color: '#f8fafc',
     fontWeight: 'bold',
     marginBottom: 8,
     fontSize: 16,
   },
   resultText: {
-    color: '#374151',
+    color: '#cbd5e1',
     lineHeight: 20,
   },
   leafList: {
@@ -1877,9 +2316,9 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   leafCard: {
-    backgroundColor: '#f7fffb',
+    backgroundColor: 'rgba(15, 23, 42, 0.7)',
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: 'rgba(125, 211, 252, 0.32)',
     borderRadius: 14,
     padding: 12,
     gap: 8,
@@ -1915,10 +2354,10 @@ const styles = StyleSheet.create({
     width: '100%',
     aspectRatio: 1,
     borderRadius: 20,
-    backgroundColor: 'rgba(236, 253, 245, 0.8)',
+    backgroundColor: 'rgba(15, 23, 42, 0.78)',
     borderWidth: 3,
     borderStyle: 'dashed',
-    borderColor: '#6ee7b7',
+    borderColor: '#38bdf8',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1934,12 +2373,12 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   placeholderText: {
-    color: '#059669',
+    color: '#7dd3fc',
     fontWeight: '500',
   },
   bottomBar: {
     padding: 24,
-    backgroundColor: 'rgba(255,255,255,0.9)',
+    backgroundColor: 'rgba(15, 23, 42, 0.92)',
     borderTopLeftRadius: 30,
     borderTopRightRadius: 30,
     shadowColor: '#000',
@@ -1954,12 +2393,12 @@ const styles = StyleSheet.create({
   },
   galleryButton: {
     flex: 1,
-    backgroundColor: '#f0fdf4',
+    backgroundColor: '#0b1a2e',
     paddingVertical: 16,
     borderRadius: 16,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: '#38bdf8',
     gap: 8,
   },
   galleryButtonText: {
@@ -1969,12 +2408,12 @@ const styles = StyleSheet.create({
   },
   cameraButton: {
     flex: 1,
-    backgroundColor: '#059669',
+    backgroundcolor: '#7dd3fc',
     paddingVertical: 16,
     borderRadius: 16,
     alignItems: 'center',
     gap: 8,
-    shadowColor: '#059669',
+    shadowcolor: '#7dd3fc',
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
     shadowRadius: 8,
@@ -1993,12 +2432,12 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingVertical: 14,
     borderRadius: 16,
-    backgroundColor: '#ecfdf5',
+    backgroundColor: '#10233c',
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: '#38bdf8',
   },
   suggestionButtonText: {
-    color: '#064e3b',
+    color: '#f8fafc',
     fontWeight: '800',
     fontSize: 14,
   },
@@ -2044,8 +2483,159 @@ const styles = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#10b981',
+    backgroundColor: '#0ea5e9',
     marginTop: 6,
+  },
+  exportPdfButton: {
+    marginTop: 12,
+    backgroundColor: '#0f766e',
+    borderRadius: 12,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  exportPdfButtonText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  timelineCard: {
+    marginTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(125, 211, 252, 0.25)',
+    paddingTop: 12,
+    gap: 8,
+  },
+  timelineHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  timelineHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  timelineTitle: {
+    color: '#e2e8f0',
+    fontWeight: '800',
+    fontSize: 15,
+  },
+  timelineMeta: {
+    color: '#7dd3fc',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  timelineSubtext: {
+    color: '#cbd5e1',
+    fontSize: 13,
+  },
+  alertText: {
+    color: '#fca5a5',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  graphRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 6,
+    height: 120,
+    marginTop: 6,
+    paddingRight: 8,
+  },
+  graphBarWrap: {
+    width: 40,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 4,
+  },
+  graphBar: {
+    width: 28,
+    borderRadius: 8,
+    minHeight: 10,
+  },
+  graphLabel: {
+    color: '#94a3b8',
+    fontSize: 10,
+  },
+  historyButton: {
+    backgroundColor: '#1d4ed8',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+  },
+  historyButtonText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 11,
+  },
+  historyOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(2, 6, 23, 0.75)',
+    justifyContent: 'flex-end',
+  },
+  historySheet: {
+    maxHeight: '75%',
+    backgroundColor: '#0f172a',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: 14,
+    borderTopWidth: 1,
+    borderColor: 'rgba(125, 211, 252, 0.35)',
+  },
+  historyHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  historyTitle: {
+    color: '#e2e8f0',
+    fontWeight: '800',
+    fontSize: 15,
+    flex: 1,
+    paddingRight: 10,
+  },
+  historyCloseButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(30, 41, 59, 0.95)',
+    borderWidth: 1,
+    borderColor: 'rgba(125, 211, 252, 0.35)',
+  },
+  historyItem: {
+    borderWidth: 1,
+    borderColor: 'rgba(125, 211, 252, 0.28)',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+    backgroundColor: 'rgba(15, 23, 42, 0.95)',
+  },
+  historyDate: {
+    color: '#7dd3fc',
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  historyText: {
+    color: '#e2e8f0',
+    fontSize: 13,
+  },
+  historyPlant: {
+    color: '#86efac',
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+  historyIssue: {
+    color: '#cbd5e1',
+    fontSize: 12,
+    marginTop: 2,
   },
   sidebarOverlay: {
     flex: 1,
@@ -2057,7 +2647,7 @@ const styles = StyleSheet.create({
   },
   sidebar: {
     width: 300,
-    backgroundColor: 'rgba(255,255,255,0.97)',
+    backgroundColor: 'rgba(15, 23, 42, 0.97)',
     padding: 18,
     borderLeftWidth: 1,
     borderLeftColor: '#d1fae5',
@@ -2071,12 +2661,12 @@ const styles = StyleSheet.create({
   sidebarTitle: {
     fontSize: 18,
     fontWeight: '800',
-    color: '#064e3b',
+    color: '#f8fafc',
   },
   sidebarUserCard: {
-    backgroundColor: '#f0fdf4',
+    backgroundColor: '#0b1a2e',
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: '#38bdf8',
     borderRadius: 16,
     padding: 14,
     marginBottom: 16,
@@ -2084,7 +2674,7 @@ const styles = StyleSheet.create({
   sidebarUserName: {
     fontSize: 16,
     fontWeight: '800',
-    color: '#064e3b',
+    color: '#f8fafc',
     marginBottom: 4,
   },
   sidebarUserEmail: {
@@ -2114,10 +2704,10 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: '#059669',
+    backgroundcolor: '#7dd3fc',
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#059669',
+    shadowcolor: '#7dd3fc',
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
     shadowRadius: 8,
@@ -2142,12 +2732,12 @@ const styles = StyleSheet.create({
     padding: 16,
     backgroundColor: '#fff',
     borderBottomWidth: 1,
-    borderBottomColor: '#d1fae5',
+    borderBottomColor: 'rgba(125, 211, 252, 0.35)',
   },
   chatHeaderTitle: {
     fontSize: 18,
     fontWeight: 'bold',
-    color: '#064e3b',
+    color: '#f8fafc',
   },
   chatBubble: {
     maxWidth: '80%',
@@ -2157,7 +2747,7 @@ const styles = StyleSheet.create({
   },
   userBubble: {
     alignSelf: 'flex-end',
-    backgroundColor: '#059669',
+    backgroundcolor: '#7dd3fc',
     borderBottomRightRadius: 2,
   },
   botBubble: {
@@ -2165,7 +2755,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderBottomLeftRadius: 2,
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: 'rgba(125, 211, 252, 0.32)',
   },
   chatText: {
     fontSize: 15,
@@ -2175,7 +2765,7 @@ const styles = StyleSheet.create({
     color: '#fff',
   },
   botChatText: {
-    color: '#334155',
+    color: '#cbd5e1',
   },
   chatInputContainer: {
     flexDirection: 'row',
@@ -2192,22 +2782,25 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     fontSize: 16,
-    color: '#334155',
+    color: '#cbd5e1',
   },
   sendButton: {
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: '#059669',
+    backgroundcolor: '#7dd3fc',
     alignItems: 'center',
     justifyContent: 'center',
   },
   typingText: {
     marginLeft: 20,
     marginBottom: 10,
-    color: '#059669',
+    color: '#7dd3fc',
     fontStyle: 'italic',
     fontSize: 12,
   },
 });
+
+
+
 

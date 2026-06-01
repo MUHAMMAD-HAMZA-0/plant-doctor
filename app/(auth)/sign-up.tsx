@@ -168,7 +168,7 @@ export default function SignUpScreen() {
 
   if (pendingVerification) {
     return (
-      <LinearGradient colors={['#f0fdf4', '#ecfdf5', '#f0fdfa']} style={styles.safeArea}>
+      <LinearGradient colors={['#f8fafc', '#eef2ff', '#ecfeff']} style={styles.safeArea}>
         <SafeAreaView style={styles.safeAreaInner}>
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -249,7 +249,7 @@ export default function SignUpScreen() {
   }
 
   return (
-    <LinearGradient colors={['#f0fdf4', '#ecfdf5', '#f0fdfa']} style={styles.safeArea}>
+    <LinearGradient colors={['#f8fafc', '#eef2ff', '#ecfeff']} style={styles.safeArea}>
       <SafeAreaView style={styles.safeAreaInner}>
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -354,27 +354,27 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   card: {
-    backgroundColor: 'rgba(255,255,255,0.92)',
-    borderRadius: 16,
-    padding: 24,
-    shadowColor: '#000',
-    shadowOpacity: 0.08,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 12,
-    elevation: 5,
+    backgroundColor: 'rgba(255,255,255,0.97)',
+    borderRadius: 22,
+    padding: 26,
+    shadowColor: '#1e293b',
+    shadowOpacity: 0.12,
+    shadowOffset: { width: 0, height: 10 },
+    shadowRadius: 24,
+    elevation: 8,
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: '#dbeafe',
   },
   title: {
-    fontSize: 28,
+    fontSize: 30,
     fontWeight: '700',
-    marginBottom: 4,
-    color: '#064e3b',
+    marginBottom: 6,
+    color: '#0f172a',
     textTransform: 'capitalize',
   },
   subtitle: {
     fontSize: 16,
-    color: '#059669',
+    color: '#475569',
     marginBottom: 24,
   },
   field: {
@@ -382,23 +382,24 @@ const styles = StyleSheet.create({
   },
   label: {
     fontSize: 14,
-    color: '#065f46',
-    marginBottom: 6,
+    color: '#1e293b',
+    marginBottom: 8,
+    fontWeight: '600',
   },
   input: {
     borderWidth: 1,
-    borderColor: '#a7f3d0',
-    borderRadius: 12,
+    borderColor: '#cbd5e1',
+    borderRadius: 14,
     paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingVertical: 13,
     fontSize: 16,
-    color: '#064e3b',
-    backgroundColor: '#f0fdf4',
+    color: '#0f172a',
+    backgroundColor: '#f8fafc',
   },
   button: {
-    backgroundColor: '#059669',
-    borderRadius: 12,
-    paddingVertical: 14,
+    backgroundColor: '#2563eb',
+    borderRadius: 14,
+    paddingVertical: 15,
     alignItems: 'center',
     marginTop: 8,
   },
@@ -418,18 +419,18 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   footerText: {
-    color: '#065f46',
+    color: '#475569',
   },
   footerLink: {
-    color: '#047857',
-    fontWeight: '600',
+    color: '#2563eb',
+    fontWeight: '700',
   },
   resendButton: {
     marginTop: 16,
     alignItems: 'center',
   },
   resendButtonText: {
-    color: '#047857',
+    color: '#2563eb',
     fontSize: 14,
     fontWeight: '600',
   },

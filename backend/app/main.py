@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -11,9 +12,11 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
 from PIL import Image
 from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pymongo import ASCENDING, DESCENDING
 from ultralytics import FastSAM, YOLO
 
 
@@ -54,6 +57,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MIN_POLYGON_AREA_RATIO", "YOLO_MIN_BOX_AREA_RATIO"),
     )
     max_leaves_for_ai: int = Field(default=24, validation_alias="MAX_LEAVES_FOR_AI")
+    mongo_uri: str = Field(
+        default="mongodb://localhost:27017",
+        validation_alias=AliasChoices("MONGO_URI", "MONGODB_URI"),
+    )
+    mongo_db_name: str = Field(default="plant_scanner", validation_alias="MONGO_DB_NAME")
     allowed_origins: list[str] = ["*"]
 
     @property
@@ -105,6 +113,28 @@ class AnalyzeResponse(BaseModel):
     aiWarning: str | None = None
 
 
+class ScanHistoryIn(BaseModel):
+    userId: str
+    plantId: str
+    damageScore: int = Field(ge=0, le=100)
+    recoveryScore: int = Field(ge=0, le=100)
+    trend: str
+    issue: str = "Unknown"
+    scannedAt: datetime | None = None
+
+
+class ScanHistoryOut(BaseModel):
+    id: str
+    userId: str
+    plantId: str
+    damageScore: int
+    recoveryScore: int
+    trend: str
+    issue: str
+    scannedAt: datetime
+    createdAt: datetime
+
+
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 app.add_middleware(
     CORSMiddleware,
@@ -116,6 +146,33 @@ app.add_middleware(
 
 
 _model_cache: FastSAM | YOLO | None = None
+mongo_client: AsyncIOMotorClient | None = None
+mongo_connected = False
+
+
+def history_collection():
+    if mongo_client is None or not mongo_connected:
+        raise HTTPException(status_code=503, detail="MongoDB is not connected.")
+    return mongo_client[settings.mongo_db_name]["scan_history"]
+
+
+def normalize_trend(value: str) -> str:
+    trend = (value or "").strip().lower()
+    return trend if trend in {"better", "worse", "stable"} else "stable"
+
+
+def map_doc_to_scan_out(doc: dict) -> ScanHistoryOut:
+    return ScanHistoryOut(
+        id=str(doc["_id"]),
+        userId=str(doc["userId"]),
+        plantId=str(doc["plantId"]),
+        damageScore=int(doc["damageScore"]),
+        recoveryScore=int(doc["recoveryScore"]),
+        trend=str(doc["trend"]),
+        issue=str(doc.get("issue", "Unknown")),
+        scannedAt=doc["scannedAt"],
+        createdAt=doc["createdAt"],
+    )
 
 
 def get_model() -> FastSAM | YOLO:
@@ -551,7 +608,74 @@ async def health() -> dict[str, str | bool]:
         "status": "ok",
         "modelReady": settings.model_path.exists() or "fastsam" in model_name,
         "modelPath": settings.model_path.as_posix(),
+        "mongoConnected": mongo_connected,
     }
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global mongo_client, mongo_connected
+    mongo_client = AsyncIOMotorClient(settings.mongo_uri)
+    try:
+        await mongo_client.admin.command("ping")
+        mongo_connected = True
+        collection = history_collection()
+        await collection.create_index(
+            [("userId", ASCENDING), ("plantId", ASCENDING), ("scannedAt", DESCENDING)]
+        )
+        logger.info("MongoDB connected for history storage.")
+    except Exception:
+        mongo_connected = False
+        logger.exception("MongoDB connection failed; history endpoints will be unavailable.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global mongo_client, mongo_connected
+    if mongo_client is not None:
+        mongo_client.close()
+        mongo_client = None
+        mongo_connected = False
+
+
+@app.post("/api/history/scan", response_model=ScanHistoryOut)
+async def save_scan_history(payload: ScanHistoryIn) -> ScanHistoryOut:
+    collection = history_collection()
+    now = datetime.now(timezone.utc)
+    doc = {
+        "userId": payload.userId.strip(),
+        "plantId": payload.plantId.strip(),
+        "damageScore": int(payload.damageScore),
+        "recoveryScore": int(payload.recoveryScore),
+        "trend": normalize_trend(payload.trend),
+        "issue": payload.issue.strip() or "Unknown",
+        "scannedAt": payload.scannedAt or now,
+        "createdAt": now,
+    }
+    if not doc["userId"]:
+        raise HTTPException(status_code=400, detail="userId is required.")
+    if not doc["plantId"]:
+        raise HTTPException(status_code=400, detail="plantId is required.")
+
+    result = await collection.insert_one(doc)
+    inserted = await collection.find_one({"_id": result.inserted_id})
+    if inserted is None:
+        raise HTTPException(status_code=500, detail="Failed to persist scan history.")
+    return map_doc_to_scan_out(inserted)
+
+
+@app.get("/api/history/{user_id}/{plant_id}", response_model=list[ScanHistoryOut])
+async def get_scan_history(user_id: str, plant_id: str, limit: int = 50) -> list[ScanHistoryOut]:
+    collection = history_collection()
+    bounded_limit = max(1, min(limit, 200))
+    cursor = (
+        collection.find({"userId": user_id, "plantId": plant_id})
+        .sort("scannedAt", DESCENDING)
+        .limit(bounded_limit)
+    )
+    docs = await cursor.to_list(length=bounded_limit)
+    docs.reverse()
+    return [map_doc_to_scan_out(doc) for doc in docs]
 
 
 @app.post("/api/analyze-plant", response_model=AnalyzeResponse)

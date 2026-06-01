@@ -108,7 +108,7 @@ export default function Page() {
 
   if (!isLoaded) {
     return (
-      <LinearGradient colors={['#f0fdf4', '#ecfdf5', '#f0fdfa']} style={styles.safeArea}>
+      <LinearGradient colors={['#f8fafc', '#eef2ff', '#ecfeff']} style={styles.safeArea}>
         <SafeAreaView style={styles.safeAreaInner}>
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#059669" />
@@ -120,7 +120,7 @@ export default function Page() {
   }
 
   return (
-    <LinearGradient colors={['#f0fdf4', '#ecfdf5', '#f0fdfa']} style={styles.safeArea}>
+    <LinearGradient colors={['#f8fafc', '#eef2ff', '#ecfeff']} style={styles.safeArea}>
       <SafeAreaView style={styles.safeAreaInner}>
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -212,7 +212,7 @@ export default function Page() {
                   <TextInput
                     style={styles.input}
                     value={value}
-                    placeholder="••••••••"
+                    placeholder="........"
                     placeholderTextColor="#9AA0B4"
                     secureTextEntry
                     onBlur={onBlur}
@@ -254,28 +254,28 @@ const styles = StyleSheet.create({
   safeAreaInner: { flex: 1 },
   wrapper: { flex: 1, padding: 24, justifyContent: 'center' },
   card: {
-    backgroundColor: 'rgba(255,255,255,0.92)',
-    borderRadius: 16,
-    padding: 24,
-    shadowColor: '#000',
-    shadowOpacity: 0.08,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 12,
-    elevation: 5,
+    backgroundColor: 'rgba(255,255,255,0.97)',
+    borderRadius: 22,
+    padding: 26,
+    shadowColor: '#1e293b',
+    shadowOpacity: 0.12,
+    shadowOffset: { width: 0, height: 10 },
+    shadowRadius: 24,
+    elevation: 8,
     borderWidth: 1,
-    borderColor: '#d1fae5',
-    gap: 4,
+    borderColor: '#dbeafe',
+    gap: 6,
   },
   title: {
-    fontSize: 28,
+    fontSize: 30,
     fontWeight: '700',
-    marginBottom: 2,
-    color: '#064e3b',
+    marginBottom: 4,
+    color: '#0f172a',
   },
   subtitle: {
     fontSize: 15,
-    color: '#059669',
-    marginBottom: 16,
+    color: '#475569',
+    marginBottom: 18,
   },
   // OAuth buttons
   oauthButton: {
@@ -289,8 +289,8 @@ const styles = StyleSheet.create({
   },
   googleButton: {
     backgroundColor: '#ffffff',
-    borderWidth: 1.5,
-    borderColor: '#dadce0',
+    borderWidth: 1.25,
+    borderColor: '#dbe3ec',
   },
   googleIcon: {
     fontSize: 18,
@@ -325,7 +325,7 @@ const styles = StyleSheet.create({
   dividerLine: {
     flex: 1,
     height: 1,
-    backgroundColor: '#d1fae5',
+    backgroundColor: '#e2e8f0',
   },
   dividerText: {
     color: '#6b7280',
@@ -334,23 +334,23 @@ const styles = StyleSheet.create({
   },
   // Form
   field: { marginBottom: 12 },
-  label: { fontSize: 14, color: '#065f46', marginBottom: 6, fontWeight: '500' },
+  label: { fontSize: 14, color: '#1e293b', marginBottom: 8, fontWeight: '600' },
   input: {
     borderWidth: 1,
-    borderColor: '#a7f3d0',
-    borderRadius: 12,
+    borderColor: '#cbd5e1',
+    borderRadius: 14,
     paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingVertical: 13,
     fontSize: 16,
-    color: '#064e3b',
-    backgroundColor: '#f0fdf4',
+    color: '#0f172a',
+    backgroundColor: '#f8fafc',
   },
   button: {
-    backgroundColor: '#059669',
-    borderRadius: 12,
-    paddingVertical: 14,
+    backgroundColor: '#2563eb',
+    borderRadius: 14,
+    paddingVertical: 15,
     alignItems: 'center',
-    marginTop: 4,
+    marginTop: 6,
   },
   buttonDisabled: { opacity: 0.6 },
   buttonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
@@ -361,8 +361,8 @@ const styles = StyleSheet.create({
     marginTop: 16,
     gap: 4,
   },
-  footerText: { color: '#065f46' },
-  footerLink: { color: '#047857', fontWeight: '600' },
+  footerText: { color: '#475569' },
+  footerLink: { color: '#2563eb', fontWeight: '700' },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
-  loadingText: { fontSize: 16, color: '#065f46', fontWeight: '600' },
+  loadingText: { fontSize: 16, color: '#334155', fontWeight: '600' },
 })

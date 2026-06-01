@@ -45,6 +45,25 @@ Or from inside `backend`:
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+## MongoDB for scan history (Docker)
+
+From repo root:
+
+```bash
+docker compose -f docker-compose.mongo.yml up -d
+```
+
+Set in `backend/.env`:
+
+```env
+MONGO_URI=mongodb://root:rootpass@localhost:27017
+MONGO_DB_NAME=plant_scanner
+```
+
+Mongo Express UI:
+
+`http://localhost:8081`
+
 ## 5. Verify backend health
 
 ```bash
