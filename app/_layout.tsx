@@ -49,7 +49,7 @@ export default function RootLayout() {
       {showLaunchImage ? (
         <View style={styles.launchContainer}>
           <ImageBackground
-            source={require('@/assets/images/plant.png')}
+            source={require('@/assets/images/plant-doctor.png')}
             style={styles.launchImage}
             resizeMode="cover"
           />

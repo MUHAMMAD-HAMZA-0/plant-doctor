@@ -4,7 +4,7 @@
     "slug": "plant-care",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/plant.png",
+    "icon": "./assets/images/plant-doctor.png",
     "scheme": "plantcare",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
@@ -22,7 +22,7 @@
       ],
       "adaptiveIcon": {
         "backgroundColor": "#ffffff",
-        "foregroundImage": "./assets/images/plant.png"
+        "foregroundImage": "./assets/images/plant-doctor.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -30,14 +30,14 @@
     },
     "web": {
       "output": "static",
-      "favicon": "./assets/images/plant.png"
+      "favicon": "./assets/images/plant-doctor.png"
     },
     "plugins": [
       "expo-router",
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/plant.png",
+          "image": "./assets/images/plant-doctor.png",
           "resizeMode": "cover",
           "backgroundColor": "#000000",
           "android": {
